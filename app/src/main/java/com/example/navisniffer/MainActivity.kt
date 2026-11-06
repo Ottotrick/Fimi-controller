@@ -12,25 +12,39 @@ import android.os.Build
 import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.view.ViewGroup
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.concurrent.Executors
 
 /**
- * Step 1 of 2: find out what the FIMI Navi sends over USB.
- * Shows accessory info, then logs every raw packet as hex (screen + file).
- * Move the sticks and press buttons one at a time so the log is easy to decode.
+ * Step 1b: sniff + experiment.
+ *  - Echo mode: sends every received packet back to the controller.
+ *  - Send hex: send custom bytes to the controller.
+ *  - Changed bytes only: shows only the byte positions that changed since the last
+ *    packet of the same type (so stick movements stand out from counters).
  */
 class MainActivity : Activity() {
 
     private lateinit var usb: UsbManager
     private lateinit var logView: TextView
     private lateinit var scroll: ScrollView
+    private lateinit var hexInput: EditText
     private var fd: ParcelFileDescriptor? = null
-    @Volatile private var running = false
+    private var out: FileOutputStream? = null
     private var logFile: FileOutputStream? = null
+    private val writer = Executors.newSingleThreadExecutor()
+    private val last = HashMap<String, ByteArray>()
+
+    @Volatile private var running = false
+    @Volatile private var echo = false
+    @Volatile private var diffOnly = false
 
     private val ACTION_PERM = "com.example.navisniffer.PERMISSION"
 
@@ -50,31 +64,51 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         usb = getSystemService(Context.USB_SERVICE) as UsbManager
-        logView = TextView(this).apply { textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE; setPadding(16, 16, 16, 16) }
-        scroll = ScrollView(this).apply {
-            addView(logView, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(16, 16, 16, 16) }
+
+        val echoBox = CheckBox(this).apply {
+            text = "Echo every packet back to controller"
+            setOnCheckedChangeListener { _, v -> echo = v }
         }
-        setContentView(scroll)
+        val diffBox = CheckBox(this).apply {
+            text = "Show changed bytes only"
+            setOnCheckedChangeListener { _, v -> diffOnly = v }
+        }
+        hexInput = EditText(this).apply { hint = "Hex to send, e.g. AE B1 01 00"; textSize = 12f }
+        val sendBtn = Button(this).apply {
+            text = "Send hex"
+            setOnClickListener { sendHex(hexInput.text.toString()) }
+        }
+        logView = TextView(this).apply { textSize = 11f; typeface = android.graphics.Typeface.MONOSPACE }
+        scroll = ScrollView(this).apply { addView(logView) }
+
+        root.addView(echoBox)
+        root.addView(diffBox)
+        root.addView(hexInput)
+        root.addView(sendBtn)
+        root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        setContentView(root)
 
         val f = IntentFilter(ACTION_PERM).apply { addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED) }
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, f, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(receiver, f)
 
         log("Plug the Navi in (or re-plug it). Waiting for accessory...")
-        handle(intent)
+        handle()
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        handle(intent)
+        handle()
     }
 
-    private fun handle(i: Intent?) {
+    private fun handle() {
         val acc = usb.accessoryList?.firstOrNull() ?: return
-        log("Accessory: manufacturer=${acc.manufacturer} model=${acc.model} version=${acc.version} desc=${acc.description} uri=${acc.uri} serial=${acc.serial}")
+        log("Accessory: manufacturer=${acc.manufacturer} model=${acc.model} version=${acc.version}")
         if (usb.hasPermission(acc)) open(acc) else {
-            val flags = PendingIntent.FLAG_MUTABLE
-            usb.requestPermission(acc, PendingIntent.getBroadcast(this, 0, Intent(ACTION_PERM).setPackage(packageName), flags))
+            usb.requestPermission(acc, PendingIntent.getBroadcast(this, 0,
+                Intent(ACTION_PERM).setPackage(packageName), PendingIntent.FLAG_MUTABLE))
         }
     }
 
@@ -82,9 +116,10 @@ class MainActivity : Activity() {
         if (running) return
         fd = usb.openAccessory(acc)
         val pfd = fd ?: run { log("openAccessory failed"); return }
+        out = FileOutputStream(pfd.fileDescriptor)
         val file = File(getExternalFilesDir(null), "navi_dump_${System.currentTimeMillis()}.txt")
         logFile = FileOutputStream(file)
-        log("Opened. Saving raw log to ${file.absolutePath}")
+        log("Opened. Raw log: ${file.absolutePath}")
         running = true
         Thread {
             val input = FileInputStream(pfd.fileDescriptor)
@@ -93,9 +128,22 @@ class MainActivity : Activity() {
                 while (running) {
                     val n = input.read(buf)
                     if (n <= 0) continue
-                    val line = "${System.currentTimeMillis()} [$n] " + buf.take(n).joinToString(" ") { "%02X".format(it) }
-                    logFile?.write((line + "\n").toByteArray())
-                    runOnUiThread { log(line) }
+                    val pkt = buf.copyOf(n)
+                    val hex = pkt.joinToString(" ") { "%02X".format(it) }
+                    logFile?.write("${System.currentTimeMillis()} [$n] $hex\n".toByteArray())
+
+                    val key = "$n-${pkt.getOrElse(9) { 0 }}"
+                    val prev = last[key]
+                    last[key] = pkt
+                    val shown = if (diffOnly && prev != null) {
+                        val changes = (0 until n).filter { pkt[it] != prev[it] }
+                        if (changes.isEmpty()) null
+                        else "[$n/%02X] ".format(pkt.getOrElse(9) { 0 }) +
+                            changes.joinToString(" ") { "#$it:%02X>%02X".format(prev[it], pkt[it]) }
+                    } else "[$n] $hex"
+                    if (shown != null) runOnUiThread { log(shown) }
+
+                    if (echo) write(pkt)
                 }
             } catch (e: Exception) {
                 runOnUiThread { log("Read stopped: ${e.message}") }
@@ -103,11 +151,26 @@ class MainActivity : Activity() {
         }.start()
     }
 
+    private fun write(bytes: ByteArray) {
+        writer.execute {
+            try { out?.write(bytes); out?.flush() }
+            catch (e: Exception) { runOnUiThread { log("Write failed: ${e.message}") } }
+        }
+    }
+
+    private fun sendHex(text: String) {
+        val clean = text.filter { it.isDigit() || it.lowercaseChar() in 'a'..'f' }
+        if (clean.length < 2 || clean.length % 2 != 0) { log("Bad hex"); return }
+        val bytes = ByteArray(clean.length / 2) { clean.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+        write(bytes)
+        log("Sent ${bytes.size} bytes")
+    }
+
     private fun close() {
         running = false
         try { fd?.close() } catch (_: Exception) {}
         try { logFile?.close() } catch (_: Exception) {}
-        fd = null
+        fd = null; out = null
     }
 
     private fun log(s: String) {
@@ -120,5 +183,6 @@ class MainActivity : Activity() {
         super.onDestroy()
         unregisterReceiver(receiver)
         close()
+        writer.shutdown()
     }
 }
